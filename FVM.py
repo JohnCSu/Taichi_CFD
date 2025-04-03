@@ -51,7 +51,7 @@ def create_FVM_cell(num_nodes:int,num_faces:int,float_dtype = ti.f32):
     node_array_ids = ti.types.vector(num_nodes,dtype=int)
      
     centroid_vector = ti.types.vector(3,dtype=float_dtype)
-
+    neighbors_matrix = ti.types.matrix(n = num_faces, m = 2,dtype= int)
 
     @ti.dataclass
     class Cell():
@@ -69,7 +69,7 @@ def create_FVM_cell(num_nodes:int,num_faces:int,float_dtype = ti.f32):
         '''(F,D) Vector'''
         faces_area: face_array_float
         '''(F,) Vector'''
-        neighbor_ids: face_array_ids # Use -1 for no neighbor
+        neighbor_ids: neighbors_matrix # Use -1 for no neighbor
         '''(F,) Vector'''
         neighbor_distance: face_array_float
         '''(F,) Vector'''
@@ -81,7 +81,33 @@ def create_FVM_cell(num_nodes:int,num_faces:int,float_dtype = ti.f32):
     return Cell
 
 
-FVM_CELL = create_FVM_cell(8,6)
+class Cell_Struct():
+    '''
+    Class for Cell_Struct, Use the `create_FVM_cell` function to instantiate Cell Structs
+    Stores predefined information such as neighbors, nodes, face normals etc into a convienent struct
+    '''
+    id:int
+    nodes: ti.Vector
+    '''(N,) Vector'''
+    centroid:ti.Vector # (3,)
+    '''(D,) Vector'''
+    faces: ti.Vector
+    '''(F,) Vector'''
+    face_normals: ti.Matrix
+    '''(F,D) Vector'''
+    faces_area: ti.Vector
+    '''(F,) Vector'''
+    neighbor_ids: ti.Matrix # Use -1 for no neighbor
+    '''(F,) Vector'''
+    neighbor_distance: ti.Vector
+    '''(F,) Vector'''
+    volume:float
+    '''Float'''
+    cell_centroid_to_face_centroid: ti.Matrix
+    '''(F,D) vector containg the distance from the cell centroid to the corresponding face centroid'''
+
+    def __init__(self):
+        raise TypeError('This is an type holder fot Cell structs please call the funciton create_FVM_cell to instantiate this taichi struct')
 
 def set_Vectorfield_from_numpy(arr:np.ndarray):
     dtype = getattr(ti,arr.dtype.name)
@@ -94,7 +120,6 @@ def set_Vectorfield_from_numpy(arr:np.ndarray):
     return f
 
 
-
 @ti.data_oriented
 class FVM():
     def __init__(self,mesh:Mesh,density:float = 1000,viscosity:float = 1e-3,dtype = ti.f32):
@@ -105,12 +130,12 @@ class FVM():
         self.dtype = dtype
         self.cellType = mesh.cellType
 
-
         self.faces = mesh.faces.to_taichi()
         self.nodes:ti.MatrixField = set_Vectorfield_from_numpy(mesh.nodes)
         '''(N,3)  Vector Field'''
         self.cells:ti.MatrixField = set_Vectorfield_from_numpy(mesh.cells)
         '''(C,F)  Vector Field'''
+        
         self.cell_centroids:ti.MatrixField = set_Vectorfield_from_numpy(mesh.cell_centroids)
         '''(C,3) Vector Field'''
 
@@ -131,8 +156,10 @@ class FVM():
         self.num_cells = mesh.cells.shape[0]
         self.num_faces = mesh.faces.unique_faces.shape[0]
         self.num_outputs = self.get_num_outputs(**self.field_structType.members)
-
-        self.FVM_cell_structType = create_FVM_cell(self.num_nodes,self.num_faces)
+        
+        self.nodes_per_cell = mesh.cells.shape[-1]
+        self.faces_per_cell = mesh.faces.id.shape[-1]
+        self.FVM_cell_structType = create_FVM_cell(self.nodes_per_cell,self.faces_per_cell)
 
 
 
@@ -168,11 +195,12 @@ class FVM():
         self.face_values:ti.Field = self.field_structType.field(shape = (self.num_faces))
         ''' Structfield containig u:vec3 and p:scalar'''
 
-        self.mass_fluxes:ti.Field = ti.field(dtype = self.dtype,shape = (self.num_cells,self.num_faces) )
-        
+        self.mass_fluxes:ti.Field = ti.field(dtype = self.dtype,shape = (self.num_cells,self.faces_per_cell) )
+        '''We need a (C,F) array'''
 
         self.nodal_values:ti.Field = self.field_structType.field(shape = (self.num_nodes))
         self.cell_values:ti.Field =  self.field_structType.field(shape = (self.num_cells))
+        '''(C,) StructField Default Struct will have u (vec3) and p (scalar)'''
         self.cell_gradients:ti.Field = self.fieldGrad_structType.field(shape=(self.num_cells))
 
         self.face_values.fill(0.)
@@ -183,33 +211,32 @@ class FVM():
 
     @ti.kernel
     def init_cell_structs(self):
-        '''
-        
-        '''
         for i in self.FVM_cells:
+            # print()
             cell = self.FVM_cells[i] 
+           
             cell.id = i
-            print(self.cells[i])
+           
             cell.nodes = self.cells[i]
             cell.centroid = self.cell_centroids[i]
             '''(D,) Vector'''
             cell.faces = self.faces.id[i]
             '''(F,) Vector'''
-            
             cell.neighbor_distance = self.faces.distance[i]
             '''(F,) Vector'''
             cell.volume = self.cell_volumes[i]
             '''Float'''
 
             cell.faces_area = self.faces.area[i]
-
-            # for j in range(self.num_faces):
-            cell.cell_centroid_to_face_centroid = ti.Matrix.rows([ self.faces.cell_centroid_to_face_centroid[i,j] for j in range(self.num_faces)])
-            cell.face_normals = ti.Matrix.rows([ self.faces.normal[i,j] for j in range(self.num_faces)])
+            
+            # print(cell.cell_centroid_to_face_centroid.n,cell.cell_centroid_to_face_centroid.m)
+            # # for j in range(self.num_faces):
+            cell.cell_centroid_to_face_centroid = ti.Matrix.rows([ self.faces.cell_centroid_to_face_centroid[i,j] for j in range(self.faces_per_cell)])
+            cell.face_normals = ti.Matrix.rows([ self.faces.normal[i,j] for j in range(self.faces_per_cell)])
             '''(F,D) Vector'''
             
             '''(F,) Vector'''
-            cell.neighbor_ids =ti.Matrix.rows([ self.faces.neighbors[i,j] for j in range(self.num_faces)])
+            cell.neighbor_ids =ti.Matrix.rows([ self.faces.neighbors[i,j] for j in range(self.faces_per_cell)])
         
     def init_step(self):
         '''
@@ -219,7 +246,7 @@ class FVM():
         self.apply_BC()
         self.u_initial_face_interpolation()
         self.calculate_mass_flux()
-        self.get_gradients()
+        # self.get_gradients()
         
     def step(self):
         self.apply_BC()
@@ -230,22 +257,28 @@ class FVM():
     @ti.kernel
     def apply_BC(self):
         for i in ti.grouped(self.face_values):
-            for j in ti.static(range(3)):
-                if self.faces.boundary_value_is_fixed[i][j]:
+            for j in range(3):
+                if self.faces.boundary_value_is_fixed[i][j] == 1:
                     self.face_values[i]['u'][j] = self.faces.boundary_value[i][j]
+                    print(self.face_values[i]['u'][j])
+            # print(self.face_values[i].u)
             if self.faces.boundary_value_is_fixed[i][3]:
                 self.face_values[i]['p'] = self.faces.boundary_value[i][3]
 
     @ti.kernel
     def calculate_mass_flux(self):
         # Lets just use central difference for now         
-        for i,j in (self.mass_fluxes): # (C,K)
-            normal:vec3 =    self.faces.normal[i,j]
-            area:float =      self.faces.area[i][j]
-            face_u = self.face_values[i].u
-
-            self.mass_fluxes[i,j] = self.density*area*normal*face_u
-
+        for i,j in self.mass_fluxes: # (C,F)
+            normal = self.faces.normal[i,j]
+            area = self.faces.area[i][j]
+            face_id = self.faces.id[i][j] # Gets faceID
+            assert face_id < self.faces.unique_faces.shape[0]
+            face_u = self.face_values[face_id].u
+            # print(face_u)
+            # self.mass_fluxes[i,j] = self.density*area*normal*face_u
+            # print(normal,area,face_u)
+        # for i in self.face_values:
+        #     print(self.face_values[i].u)
 
     @ti.kernel
     def u_initial_face_interpolation(self):
@@ -258,12 +291,10 @@ class FVM():
             #Given a Face, find the neighbors and calulate velocity 
             # Check if a boundary face
             adj_vec = self.faces.adjacent_cells[i]
-            C_n,C_p = adj_vec
-            centroid_n = self.cell_centroids[C_n]
-            centroid_p = self.cell_centroids[C_p]
-            face_centroid = self.faces.centroid[i]
-            u_n,u_p = self.cell_values[C_n].u,self.cell_values[C_p].u
-            u = central_difference(centroid_p,centroid_n,face_centroid,u_p,u_n)
+            C_o,C_n = adj_vec
+            owner_cell, neighbor_cell = self.FVM_cells[C_o],self.FVM_cells[C_n]
+            u_owner = self.cell_values[C_o].u,self.cell_values[C_n].u 
+            u = central_difference(i,owner_cell,neighbor_cell,)
             for j in ti.static(range(3)):
                 if not self.faces.boundary_value_is_fixed[i][j]:
                     self.face_values[i].u[j] = u[j]
@@ -280,10 +311,7 @@ class FVM():
             # Check if a boundary face
             adj_vec = self.faces.adjacent_cells[i]
             C_n,C_p = adj_vec
-            centroid_n = self.cell_centroids[C_n]
-            centroid_p = self.cell_centroids[C_p]
-            face_centroid = self.faces.centroid[i]
-            u_n,u_p = self.cell_values[C_n].u,self.cell_values[C_p].u
+            Cell_n, Cell_p = self.FVM_cells[C_n],self.FVM_cells[C_p]
             u = upwind_linear(cell_r_i,cell_r_j,)
             for j in ti.static(range(3)):
                 if not self.faces.boundary_value_is_fixed[i][j]:
@@ -308,10 +336,14 @@ class FVM():
     
     
 @ti.func
-def central_difference(cell_centroid_i:ti.math.vec3,cell_centroid_j:ti.math.vec3,face_centroid:ti.math.vec3,u_i,u_j):
-    '''Face Interpolation Scheme Via Central Difference'''
-    psi = ti.math.length(face_centroid - cell_centroid_i)/ti.math.length(cell_centroid_j - cell_centroid_i)
-    return u_i*psi + (1-psi)*u_j
+def central_difference(face_id,owner_cell:Cell_Struct,neighbor_cell:Cell_Struct,u_owner,u_neighbor):
+    '''Face Interpolation Scheme Via Central Difference
+    We use owner/neighbor terminology although it wont matter for this case
+    '''
+
+    centroid_dist = owner_cell.cell_centroid_to_face_centroid[face_id,:]
+    psi = ti.math.length(centroid_dist)/ti.math.length(owner_cell.centroid - neighbor_cell.centroid)
+    return u_owner*psi + (1-psi)*u_neighbor
 
 @ti.func
 def upwind_linear(cell_r_i,cell_r_j,u_i,u_j,grad_u_i,grad_u_j,mass_flux:float):
@@ -341,6 +373,8 @@ if __name__ == '__main__':
     m = Mesh(mesh)
     m.set_boundary_value(0,u = 1,v = 2,w = 3.3,p = 2)
     model = FVM(m)
-    print(model.cell_centroids.shape,model.nodes.shape, model.cells.shape)
+    # print(model.cell_centroids.shape,model.nodes.shape, model.cells.shape)
+    print(model.face_values[0].u)
     model.init_step()
+    # print(model.face_values[0].u)
     # model.face_interpolate('hello WORLD')
